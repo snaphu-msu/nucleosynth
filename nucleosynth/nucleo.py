@@ -14,7 +14,7 @@ r_start = 15e6
 r_shock_target = 1.0e9
 r_end = 1.1e9
 
-def get_initial_composition(progenitor, at_radius, verbose = False):
+def get_initial_composition(progenitor, at_radius):
     """Get the composition of a progenitor at a given radius.
 
     parameters
@@ -34,26 +34,13 @@ def get_initial_composition(progenitor, at_radius, verbose = False):
     fraction = (radii[index] - at_radius) / (radii[index] - radii[index-1])
     zone_data = fraction * comp[index-1] + (1.0 - fraction) * comp[index]
 
-    missing_elements = []
-    initY = np.zeros(len(skynetA))
-    prog_network = progenitor.composition.columns
-
     # For every isotope in the SkyNet network, find the progenitor abundances
     # TODO: Verify with Sean that it's okay to set comps less than 0 to 0.
+    initY = np.zeros(len(skynetA))
+    network = progenitor.composition.columns
     for i in range(len(skynetA)):
         iso = 'neutrons' if skynetZ[i] == 0 else elements.elements[skynetZ[i]] + str(skynetA[i])
-        if iso in prog_network:
-            initY[i] = max(zone_data[prog_network.get_loc(iso)], 0.0)
-            if verbose:
-                print(f"{iso} at radius of {at_radius}: {initY[i]}")
-
-        # If the isotope is not in the progenitor's network, set it to 0
-        else:
-            missing_elements.append(iso)
-            initY[i] = 0.0
-
-    if verbose and len(missing_elements) > 0:
-        print("Elements missing from progenitor composition:", missing_elements)
+        initY[i] = max(zone_data[network.get_loc(iso)], 0.0) if iso in network else 0.0
             
     # Return the initial composition normalized by the total mass fractions in the zone
     return initY / (np.sum(initY) * np.array(skynetA))
@@ -92,6 +79,16 @@ def do_nucleosynthesis(model_path, stir_model, progenitor, tracers, output_path,
     else:
         i = np.where(rshock <= r_shock_target)[0][0]
 
+    # Reports on which elements are missing from the progenitor composition
+    if verbose:
+        missing_elements = []
+        for i in range(len(skynetA)):
+            iso = 'neutrons' if skynetZ[i] == 0 else elements.elements[skynetZ[i]] + str(skynetA[i])
+            if iso not in progenitor.composition.columns:
+                missing_elements.append(iso)
+        if len(missing_elements) > 0:
+            print("Elements missing from progenitor composition:", missing_elements)
+
     # TODO: Why is this in log space and then log10 of the radii?
     radii = np.logspace(np.log10(r_start), np.log10(r_end), num_tracers)
     if verbose: 
@@ -127,8 +124,6 @@ def do_nucleosynthesis(model_path, stir_model, progenitor, tracers, output_path,
             tracers["ye  "].values[:, j]
         ]).T, 0)
 
-        print(trajectory_data)
-
         # TODO: Evan was setting the final time here before setting boundary conditions
         # But won't skynet stop at this time then, instead of allowing things to settle like below?
         final_time = trajectory_data[-1][0]
@@ -153,7 +148,7 @@ def do_nucleosynthesis(model_path, stir_model, progenitor, tracers, output_path,
         # Otherwise, get the intial composition from the progenitor and run without NSE
         else:
             starting_radius = tracers["r"].values[-1, j] # TODO: Should this actually be the first radius and not the last of that mass element?
-            initY = get_initial_composition(progenitor, starting_radius, verbose)
+            initY = get_initial_composition(progenitor, starting_radius)
             run_skynet(True, True, final_time, trajectory_data, outfile = filebase, do_NSE = False, init_composition = initY)
 
         h5file = h5py.File(filebase + ".h5", "r")
