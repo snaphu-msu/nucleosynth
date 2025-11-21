@@ -5,14 +5,31 @@ from .config import elements
 from SkyNet import SkyNetRoot, NetworkOptions, HelmholtzEOS, NuclideLibrary, \
     REACLIBReactionLibrary, ReactionType, LeptonMode, SkyNetScreening, ReactionNetwork, \
     NetworkConvergenceCriterion, PiecewiseLinearFunction
+import pandas as pd
+from tqdm import tqdm
+import pynucastro as pyna
+from pynucastro.rates import ReacLibRate, TabularRate
+
+import numpy as np
+import matplotlib.pyplot as plt
+import yt
+import pynucastro as pyna
+import itertools
+import seaborn as sns
 
 NSEtemp = 6e9  # K
 ncomps = 686
 
-# TODO: Check with Sean - Should these values stay hardcoded or should we get the values from the progenitor/stir data?
-r_start = 15e6
-r_shock_target = 1.0e9
-r_end = 1.1e9
+# Q: Why is this only 20 isotopes?
+default_nse_network = [
+    "n", "p",
+    "he3", "he4",
+    "n14",
+    "c12", "o16",
+    "ne20", "mg24", "si28", "s32", "ar36", "ca40", "ti44",
+    "cr48", "fe52", "fe54", "fe56", "ni56",
+    "cr56",
+]
 
 def get_initial_composition(progenitor, at_radius):
     """Get the composition of a progenitor at a given radius.
@@ -35,7 +52,6 @@ def get_initial_composition(progenitor, at_radius):
     zone_data = fraction * comp[index-1] + (1.0 - fraction) * comp[index]
 
     # For every isotope in the SkyNet network, find the progenitor abundances
-    # TODO: Verify with Sean that it's okay to set comps less than 0 to 0.
     initY = np.zeros(len(skynetA))
     network = progenitor.composition.columns
     for i in range(len(skynetA)):
@@ -45,13 +61,46 @@ def get_initial_composition(progenitor, at_radius):
     # Return the initial composition normalized by the total mass fractions in the zone
     return initY / (np.sum(initY) * np.array(skynetA))
 
-def do_nucleosynthesis(model_path, stir_model, progenitor, tracers, output_path, verbose = False):
-    """Perform nucleosynthesis on a set of tracers using SkyNet.
+
+def do_nse_nucleosynthesis(model_path, network=None):
+    """Perform NSE nucleosynthesis on a set of tracers using PyNucAstro. Automatically compiles tracers.
 
     parameters
     ----------
     model_path : str
-        The path to the STIR simulation's output folder.
+        The path to the STIR simulation's folder.
+    network : list, optional
+        The list of nuclei to include in the NSE network. If None, the default 21-isotope network will be used.
+    """
+
+    # If no network is provided, use the default 21-isotope network
+    if network is None:
+        network = default_nse_network
+
+    # Load in the relevant STIR data
+    last_checkpoint = model_path + "/output/" + sorted([f for f in os.listdir(model_path + "/output") if "chk" in f])[-1]
+    stir_data = yt.load(last_checkpoint).all_data()
+    dens = np.array(stir_data['dens'])
+    temp = np.array(stir_data['temp'])
+    ye = np.array(stir_data['ye  '])
+
+    # Run pynucastro's NSE network to get composition of each cell
+    nse = pyna.NSENetwork(inert_nuclei = network)
+    comps = pd.DataFrame()
+    for tracer in range(np.size(dens)):
+        comp, sol = nse.get_comp_nse(dens[tracer], temp[tracer], ye[tracer], use_coulomb_corr=True, return_sol=True)
+        comps = pd.concat([comps, pd.DataFrame([comp.data])], ignore_index=True)
+
+    return comps
+
+
+def do_nucleosynthesis(model_path, stir_model, progenitor, domain_radius, tracers, output_path, verbose = 0):
+    """Perform nucleosynthesis on a set of tracers using SkyNet or PyNucAstro.
+
+    parameters
+    ----------
+    model_path : str
+        The path to the STIR simulation's folder.
     stir_model : str
         The name of the STIR model, which is the filename (without extension) of the .dat file.
     progenitor : progs.ProgModel
@@ -59,44 +108,32 @@ def do_nucleosynthesis(model_path, stir_model, progenitor, tracers, output_path,
     tracers : pandas.DataFrame
         Tracers created using STIR data, containing the time, temperature, density, and electron fraction for each mass element tracer. These should be created using the flashbang module's get_tracers function.
     output_path : str
-        The path where the output files will be saved.
-    verbose : bool, optional
-        If True, print additional information about the nucleosynthesis process. Default is False.
+        The path where the SkyNet output files will be saved.
+    verbose : int, optional
+        If 0, very little information is printed. If 1, some info is printed. If 2, skynet stdoutput is also printed.
     """
 
     num_tracers = len(tracers["mass"].values)
 
     # Find the end point of nucleosynthesis
-    time, rshock = np.loadtxt(model_path + "/" + stir_model + ".dat", unpack=True, usecols=(0, 11))
-    if verbose: print("Shock Radius:", rshock)
+    _, rshock = np.loadtxt(model_path + "/" + stir_model + ".dat", unpack=True, usecols=(0, 11))
+    if verbose > 0: print("Shock Radius:", rshock)
 
     # If the shock radius is not far enough, the star hasn't exploded
-    if rshock[-1] < r_shock_target:
+    # TODO: Get r_shock_target as ~90% of the max radius from a stir checkpoint file
+    if rshock[-1] < domain_radius * 0.9:
         print("Star failed to explode, no nucleosynthesis will be done.")
-        return
+        return None
     
-    # Otherwise, find the index of the shock radius closes to the target
+    # Otherwise, find the index of the shock radius closest to the target
     else:
-        i = np.where(rshock <= r_shock_target)[0][0]
+        i = np.where(rshock <= domain_radius * 0.9)[0][0]
 
-    # Reports on which elements are missing from the progenitor composition
-    if verbose:
-        missing_elements = []
-        for i in range(len(skynetA)):
-            iso = 'neutrons' if skynetZ[i] == 0 else elements.elements[skynetZ[i]] + str(skynetA[i])
-            if iso not in progenitor.composition.columns:
-                missing_elements.append(iso)
-        if len(missing_elements) > 0:
-            print("Elements missing from progenitor composition:", missing_elements)
-
-    # TODO: Why is this in log space and then log10 of the radii?
-    radii = np.logspace(np.log10(r_start), np.log10(r_end), num_tracers)
-    if verbose: 
-        print("Lowest Radius:", radii[0])
-        print("Highest Radius:", radii[-1])
+    # Pull the final radii of each tracer
+    radii = tracers["r"].values[-1]
+    if verbose > 0: print("Radii:", radii[0], "-->", radii[-1])
 
     # Calculate the volume of each shell
-    # TODO: Could be simplified
     volume = np.zeros(num_tracers)
     volume[0] = (4.0 * np.pi / 3.0) * (((radii[1] + radii[0]) / 2.0) ** 3 - radii[0] ** 3)
     volume[-1] = (4.0 * np.pi / 3.0) * (radii[-1] ** 3 - ((radii[-1] + radii[-2]) / 2.0) ** 3)
@@ -106,76 +143,109 @@ def do_nucleosynthesis(model_path, stir_model, progenitor, tracers, output_path,
             - ((radii[i] + radii[i - 1]) / 2.0) ** 3
         )
 
-    if verbose: 
-        print("Total Volume:", sum(volume))
+    if verbose > 0: print("Total Volume:", sum(volume))
+
+    # Reports on which elements are missing from the progenitor composition
+    if verbose > 0:
+        missing_elements = []
+        for i in range(len(skynetA)):
+            iso = 'neutrons' if skynetZ[i] == 0 else elements.elements[skynetZ[i]] + str(skynetA[i])
+            if iso not in progenitor.composition.columns:
+                missing_elements.append(iso)
+        if len(missing_elements) > 0:
+            print("Elements missing from progenitor composition:", missing_elements)
 
     final_composition = np.zeros((ncomps + 1) * num_tracers).reshape(num_tracers, (ncomps + 1))
-    for j in range(num_tracers):
 
-        print(f"Performing Nucleosynthesis: {j}/{num_tracers}")
+    for mass_element in tqdm(range(num_tracers)):
 
-        pID = int(tracers["chk"].values[j])
+        pID = int(tracers["mass"].values[mass_element])
 
         # Creates a 2D array where each row is data from a time step, ordered from last to first step
-        trajectory_data = np.flip(np.asarray([
+        trajectory_data = np.asarray([
             tracers["time"].values,
-            tracers["temp"].values[:, j] / 1e9,
-            tracers["dens"].values[:, j],
-            tracers["ye  "].values[:, j]
-        ]).T, 0)
+            tracers["temp"].values[:, mass_element] / 1e9,
+            tracers["dens"].values[:, mass_element],
+            tracers["ye  "].values[:, mass_element]
+        ]).T
 
-        # TODO: Evan was setting the final time here before setting boundary conditions
-        # But won't skynet stop at this time then, instead of allowing things to settle like below?
-        final_time = trajectory_data[-1][0]
+        # Adds additional time steps in which the material cools down and diffuses 
+        cooldown_steps = 20
+        cooldown_timestep = 1
+        cooldown_start_time = trajectory_data[-1][0]
+        cooldown_start_temp = trajectory_data[-1][1]
+        cooldown_start_dens = trajectory_data[-1][2]
+        times = np.concatenate((cooldown_start_time + cooldown_timestep * np.arange(0, cooldown_steps), [1000.0, 2000.0]))
 
-        # Sets boundary conditions in time as petering off to a stable nuclear state
-        tstep = trajectory_data[-1][0] - trajectory_data[-2][0]
-        times = np.concatenate((trajectory_data[-1][0] + tstep * np.arange(0, 10), [1000.0, 2000.0]))
-        temps = np.concatenate((np.linspace(trajectory_data[-1][1], 1e-5, 10), [1e-5, 1e-5]))
-        dens = np.concatenate((np.linspace(trajectory_data[-1][2], 1e-10, 10), [1e-10, 1e-10]))
         for i in range(1, len(times)):
-            new_element = np.array([times[i], temps[i], dens[i], trajectory_data[-1][3]])
+            if times[i] >= 1000:
+                temp, dens = 1e-5, 1e-10
+            else:
+                t = (1 + times[i] - cooldown_start_time)
+                temp = cooldown_start_temp * t ** -1
+                dens = cooldown_start_dens * t ** -3
+            new_element = np.array([times[i], temp, dens, trajectory_data[-1][3]])
             trajectory_data = np.concatenate((trajectory_data, [new_element]))
 
         os.makedirs(output_path, exist_ok = True)
         filebase = output_path + "/nucleo_" + stir_model + str(pID)
 
-        # Runs SkyNet with NSE if temperatures are above 1e9 and densities are not too high
-        # TODO: Check with Sean if the added rho check is normal
-        if trajectory_data[0, 1] > NSEtemp / 1e9 and trajectory_data[0, 2] < 1e13:
-            run_skynet(True, True, final_time, trajectory_data, outfile = filebase)
+        # Runs SkyNet with NSE if temperatures are above 1e9, densities are not too high, and Ye is not too low
+        if trajectory_data[0, 1] > NSEtemp / 1e9 and trajectory_data[0, 2] < 1e13 and trajectory_data[0, 3] >= 0.001:
+            run_skynet(True, True, cooldown_start_time, trajectory_data, outfile = filebase, verbose = verbose > 1)
 
         # Otherwise, get the intial composition from the progenitor and run without NSE
         else:
-            starting_radius = tracers["r"].values[-1, j] # TODO: Should this actually be the first radius and not the last of that mass element?
+            starting_radius = tracers["r"].values[-1, mass_element]
             initY = get_initial_composition(progenitor, starting_radius)
-            run_skynet(True, True, final_time, trajectory_data, outfile = filebase, do_NSE = False, init_composition = initY)
+            run_skynet(True, True, cooldown_start_time, trajectory_data, outfile = filebase, 
+                       do_NSE = False, init_composition = initY, verbose = verbose > 1)
 
         h5file = h5py.File(filebase + ".h5", "r")
         As = h5file["A"]
         final_massfracs = h5file["Y"][-1] * As[:]
 
-        final_composition[j, 0] = float(pID)
-        final_composition[j, 1:] = final_massfracs[:]
+        final_composition[mass_element, 0] = float(pID)
+        final_composition[mass_element, 1:] = final_massfracs[:]
 
         h5file.close()
 
-    np.save(output_path + "/final_" + stir_model + "_comps.npy", final_composition)
-
-    totalmasses = {}
-
-    for j in range(ncomps):
-        if skynetZ[j] == 0:
-            iso = "neut"
+    # Create list of isotope names for DataFrame columns
+    iso_names = []
+    for mass_element in range(ncomps):
+        if skynetZ[mass_element] == 0:
+            iso_names.append("neut")
         else:
-            iso = elements.elements[skynetZ[j] - 1] + str(skynetA[j])
+            iso_names.append(elements.elements[skynetZ[mass_element]] + str(skynetA[mass_element]))
 
-        totalmasses[iso] = sum(volume[:] * tracers["dens"].values[0, :] * final_composition[:, 1 + j])
+    columns = ["mass"] + iso_names
+    df = pd.DataFrame(columns=columns)
+    df["mass"] = tracers["mass"].values
+    df.iloc[:, 1:] = final_composition[:, 1:ncomps+1]
 
-    np.save(output_path + "/totalmasses_" + stir_model + ".npy", totalmasses)
-    return totalmasses
+    return df
 
-def run_skynet(do_inv, do_screen, end_time, trajectory_data, outfile, do_NSE=True, init_composition=None):
+# TODO: Work in progress
+def run_pynucastro(tracers):
+    """Perform nucleosynthesis on a set of tracers using PyNucAstro."""
+
+    rl = pyna.ReacLibLibrary()
+
+    all_nuclei = ["p", "he4",
+                "c12", "n13",
+                "o16", "ne20", "na23",
+                "mg24", "al27", "si28",
+                "p31", "s32", "cl35",
+                "ar36", "k39", "ca40",
+                "sc43", "ti44", "v47",
+                "cr48", "mn51",
+                "fe52","co55","ni56"]
+
+    lib = rl.linking_nuclei(all_nuclei)
+    nse = pyna.NSENetwork(libraries=lib, use_unreliable_spins=False)
+
+
+def run_skynet(do_inv, do_screen, end_time, trajectory_data, outfile, do_NSE=True, init_composition=None, verbose=False):
 
     with open(SkyNetRoot + "/examples/code_tests/X-ray_burst/sunet") as f:
         nuclides = [l.strip() for l in f.readlines()]
@@ -187,8 +257,8 @@ def run_skynet(do_inv, do_screen, end_time, trajectory_data, outfile, do_NSE=Tru
     opts.MassDeviationThreshold = 1.0E-10
     opts.IsSelfHeating = False
     opts.EnableScreening = do_screen
-    opts.DisableStdoutOutput = True
-    opts.MaxDt = 0.001
+    opts.DisableStdoutOutput = not(verbose)
+    opts.MaxDt = 0.2
 
     reactionLibraries = [
         REACLIBReactionLibrary(SkyNetRoot + "/examples/code_tests/reaclib", ReactionType.Strong, do_inv, LeptonMode.TreatAllAsDecayExceptLabelEC, 
@@ -207,10 +277,10 @@ def run_skynet(do_inv, do_screen, end_time, trajectory_data, outfile, do_NSE=Tru
 
     density_vs_time = PiecewiseLinearFunction(trajectory_data[:,0], trajectory_data[:,2], True)
     temperature_vs_time = PiecewiseLinearFunction(trajectory_data[:,0], trajectory_data[:,1], True)
-    Ye0 = trajectory_data[0,3]
     start_time = trajectory_data[0,0] + 1.0e-20
 
     if do_NSE:
+        Ye0 = trajectory_data[0, 3]
         output = net.EvolveFromNSE(start_time, end_time, temperature_vs_time, density_vs_time, Ye0, outfile)
     else:
         output = net.Evolve(init_composition, start_time, end_time, temperature_vs_time, density_vs_time, outfile)
