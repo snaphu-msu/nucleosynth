@@ -83,6 +83,7 @@ def do_nse_nucleosynthesis(model_path, network=None):
     dens = np.array(stir_data['dens'])
     temp = np.array(stir_data['temp'])
     ye = np.array(stir_data['ye  '])
+    mass = np.cumsum(stir_data['cell_volume'] * dens) / 2.e33
 
     # Run pynucastro's NSE network to get composition of each cell
     nse = pyna.NSENetwork(inert_nuclei = network)
@@ -90,6 +91,9 @@ def do_nse_nucleosynthesis(model_path, network=None):
     for tracer in range(np.size(dens)):
         comp, sol = nse.get_comp_nse(dens[tracer], temp[tracer], ye[tracer], use_coulomb_corr=True, return_sol=True)
         comps = pd.concat([comps, pd.DataFrame([comp.data])], ignore_index=True)
+
+    # Add an enclosed mass column
+    comps["mass"] = mass
 
     return comps
 
