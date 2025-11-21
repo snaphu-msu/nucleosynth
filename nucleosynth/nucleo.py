@@ -20,7 +20,7 @@ import seaborn as sns
 NSEtemp = 6e9  # K
 ncomps = 686
 
-# Q: Why is this only 20 isotopes?
+# Isotopes used in MESA's Approx21 network
 default_nse_network = [
     "n", "p",
     "he3", "he4",
